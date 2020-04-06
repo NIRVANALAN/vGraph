@@ -24,7 +24,7 @@ import collections
 import re
 
 from data_utils import load_cora_citeseer, load_webkb
-from utils import calc_nonoverlap_nmi
+from score_utils import calc_nonoverlap_nmi
 import community
 import torch
 import numpy as np
@@ -40,7 +40,7 @@ parser.add_argument('--epochs', type=int, default=1001, help='Number of epochs t
 parser.add_argument('--embedding-dim', type=int, default=128, help='')
 parser.add_argument('--lr', type=float, default=0.1, help='Initial learning rate.')
 parser.add_argument('--dropout', type=float, default=0., help='Dropout rate (1 - keep probability).')
-parser.add_argument('--dataset-str', type=str, default='facebook0', help='type of dataset.')
+parser.add_argument('--dataset-str', type=str, default='cora', help='type of dataset.')
 # parser.add_argument('--task', type=str, default='community', help='type of dataset.')
 
 
@@ -106,13 +106,7 @@ def classical_modularity_calculator(graph, embedding, model='gcn_vae', cluster_n
 def loss_function(recon_c, q_y, prior, c, norm=None, pos_weight=None):
     
     BCE = F.cross_entropy(recon_c, c, reduction='sum') / c.shape[0]
-    # BCE = F.binary_cross_entropy_with_logits(recon_c, c, pos_weight=pos_weight)
-    # return BCE
-
-    log_qy = torch.log(q_y  + 1e-20)
-    KLD = torch.sum(q_y*(log_qy - torch.log(prior)),dim=-1).mean()
-
-    ent = (- torch.log(q_y) * q_y).sum(dim=-1).mean()
+    KLD = F.kl_div(torch.log(prior), q_y, reduction='batchmean')
     return BCE + KLD
 
 class GCNModelGumbel(nn.Module):
@@ -225,7 +219,7 @@ if __name__ == '__main__':
         cur_loss = loss.item()
         optimizer.step()
         
-        if epoch % 100 == 0:
+        if epoch % 10 == 0:
             temp = np.maximum(temp*np.exp(-ANNEAL_RATE*epoch),temp_min)
             
             model.eval()
