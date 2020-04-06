@@ -1,35 +1,32 @@
-from __future__ import division
-from __future__ import print_function
+from __future__ import division, print_function
 
 import argparse
-import time
-from tqdm import tqdm
+import collections
 import math
-import numpy as np
+import re
+import time
 from subprocess import check_output
+import pdb
 
+import community
 import networkx as nx
 import numpy as np
 import scipy.sparse as sp
 import torch
-import torch.nn.functional as F
-from torch import optim
-
-import torch
 import torch.nn as nn
-import numpy as np
+import torch.nn.functional as F
+from dgl import DGLGraph
+from dgl.data import load_data, register_data_args
+from dgl.nn.pytorch import GraphConv
+from dgl.transform import remove_self_loop
+from sklearn.cluster import KMeans
+from torch import optim
 from torch.autograd import Variable
-
-import collections
-import re
+from tqdm import tqdm
 
 from data_utils import load_cora_citeseer, load_webkb
+from gcn.gcn import GCN
 from score_utils import calc_nonoverlap_nmi
-import community
-import torch
-import numpy as np
-from sklearn.cluster import KMeans
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', type=str, default='s', help="models used")
@@ -38,18 +35,24 @@ parser.add_argument('--seed', type=int, default=42, help='Random seed.')
 parser.add_argument('--epochs', type=int, default=1001,
                     help='Number of epochs to train.')
 parser.add_argument('--embedding-dim', type=int, default=128, help='')
-parser.add_argument('--lr', type=float, default=0.05,
+parser.add_argument('--lr', type=float, default=0.1,
                     help='Initial learning rate.')
-parser.add_argument('--dropout', type=float, default=0.,
+parser.add_argument('--dropout', type=float, default=0.5,
                     help='Dropout rate (1 - keep probability).')
-parser.add_argument('--dataset-str', type=str,
-                    default='cora', help='type of dataset.')
+parser.add_argument('--dataset', type=str, default='cora',
+                    help='type of dataset.')
+parser.add_argument("--gpu", type=int, default=7, help="gpu")
+# * GCN
+parser.add_argument("--n-layers", type=int, default=1,
+                    help="number of hidden gcn layers")
+parser.add_argument("--self-loop", action='store_true',
+                    help="graph self-loop (default=False)")
 # parser.add_argument('--task', type=str, default='community', help='type of dataset.')
 
 
 def logging(args, epochs, nmi, modularity):
     with open('mynlog', 'a+') as f:
-        f.write('{},{},{},{},{},{},{},{}\n'.format('gcn_vae', args.dataset_str,
+        f.write('{},{},{},{},{},{},{},{}\n'.format('gcn_vae', args.dataset,
                                                    args.lr, args.embedding_dim, args.lamda, epochs, nmi, modularity))
 
 
@@ -69,11 +72,11 @@ def preprocess(fpath):
     write_to_file(fpath, clist)
 
 
-def get_assignment(G, model, num_classes=5, tpe=0):
+def get_assignment(G, model, num_classes=5, tpe=0, features=None):
     model.eval()
     edges = [(u, v) for u, v in G.edges()]
     batch = torch.LongTensor(edges)
-    _, q, _ = model(batch[:, 0], batch[:, 1], 1.)
+    _, q, _ = model(batch[:, 0], batch[:, 1], 1., features)
 
     num_classes = q.shape[1]
     q_argmax = q.argmax(dim=-1)
@@ -120,7 +123,7 @@ def loss_function(recon_c, q_y, prior, c, norm=None, pos_weight=None):
 
 
 class GCNModelGumbel(nn.Module):
-    def __init__(self, size, embedding_dim, categorical_dim, dropout, device):
+    def __init__(self, size, embedding_dim, categorical_dim, device, embedding_model):
         super(GCNModelGumbel, self).__init__()
         self.embedding_dim = embedding_dim
         self.categorical_dim = categorical_dim
@@ -129,7 +132,8 @@ class GCNModelGumbel(nn.Module):
 
         self.community_embeddings = nn.Linear(
             embedding_dim, categorical_dim, bias=False).to(device)
-        self.node_embeddings = nn.Embedding(size, embedding_dim)
+        self.node_embeddings_encoder = nn.Embedding(size, embedding_dim)
+        # self.node_embeddings_encoder = embedding_model
         self.contextnode_embeddings = nn.Embedding(size, embedding_dim)
 
         self.decoder = nn.Sequential(
@@ -146,10 +150,14 @@ class GCNModelGumbel(nn.Module):
                 if m.bias is not None:
                     m.bias.data.fill_(0.0)
 
-    def forward(self, w, c, temp):
+    def forward(self, w, c, temp, features):
 
-        w = self.node_embeddings(w).to(self.device)
-        c = self.node_embeddings(c).to(self.device)
+
+        # encoder_h = self.node_embeddings_encoder(features)
+        # w = encoder_h[w]
+        # c = encoder_h[c]
+        w = self.node_embeddings_encoder(w).to(self.device)
+        c = self.node_embeddings_encoder(c).to(self.device)
 
         q = self.community_embeddings(w*c)
         # q.shape: [batch_size, categorical_dim]
@@ -167,6 +175,7 @@ class GCNModelGumbel(nn.Module):
         # z.shape [batch_size, categorical_dim]
         new_z = torch.mm(z, self.community_embeddings.weight)
         recon = self.decoder(new_z)
+        import pdb; pdb.set_trace()
 
         return recon, F.softmax(q, dim=-1), prior
 
@@ -181,33 +190,52 @@ if __name__ == '__main__':
     ANNEAL_RATE = 0.00003
 
     # In[13]:
-    if args.dataset_str in ['cora', 'citeseer']:
-        G, adj, gt_membership = load_cora_citeseer(args.dataset_str)
+    if args.dataset in ['cora', 'citeseer']:
+        G, adj, gt_membership = load_cora_citeseer(args.dataset)
     else:
-        G, adj, gt_membership = load_webkb(args.dataset_str)
+        G, adj, gt_membership = load_webkb(args.dataset)
+    # * LOAD GCN DECODER
+    data = load_data(args)
+    torch.cuda.set_device(args.gpu)
+    features = torch.FloatTensor(data.features).cuda()
+    device = features.device  # TODO
+    in_feats = features.shape[1]
+    n_classes = data.num_labels
+    # graph preprocess and calculate normalization factor
+    # add self loop
+    g = DGLGraph(G)
+    if args.self_loop:
+        g = remove_self_loop(g)
+    n_edges = g.number_of_edges()
+    # normalization
+    degs = g.in_degrees().float()
+    norm = torch.pow(degs, -0.5)
+    norm[torch.isinf(norm)] = 0
+    norm = norm.cuda()
+    g.ndata['norm'] = norm.unsqueeze(1)
 
-    adj_orig = adj
-    adj_orig = adj_orig - \
-        sp.dia_matrix((adj_orig.diagonal()[np.newaxis, :], [
-                      0]), shape=adj_orig.shape)
-    adj_orig.eliminate_zeros()
+    # create GCN model
+    gcn_encoder = GCN(g,
+                      in_feats,
+                      args.embedding_dim,
+                      n_classes,
+                      args.n_layers,
+                      F.relu,
+                      args.dropout).cuda()
+    # adj_orig = adj
+    # adj_orig = adj_orig - sp.dia_matrix((adj_orig.diagonal()[np.newaxis, :], [0]), shape=adj_orig.shape)
+    # adj_orig.eliminate_zeros()
     categorical_dim = len(set(gt_membership))
     n_nodes = G.number_of_nodes()
     print(n_nodes, categorical_dim)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = GCNModelGumbel(
-        adj.shape[0], embedding_dim, categorical_dim, args.dropout, device)
+        adj.shape[0], embedding_dim, categorical_dim, device, gcn_encoder)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    hidden_emb = None
-    history_valap = []
-    history_mod = []
 
     train_edges = [(u, v) for u, v in G.edges()]
     n_nodes = G.number_of_nodes()
     print('len(train_edges)', len(train_edges))
-    start = time.time()
     for epoch in range(epochs):
 
         t = time.time()
@@ -219,7 +247,7 @@ if __name__ == '__main__':
 
         w = torch.cat((batch[:, 0], batch[:, 1]))
         c = torch.cat((batch[:, 1], batch[:, 0]))
-        recon, q, prior = model(w, c, temp)
+        recon, q, prior = model(w, c, temp, features)
 
         res = torch.zeros([n_nodes, categorical_dim],
                           dtype=torch.float32).to(device)
@@ -240,7 +268,7 @@ if __name__ == '__main__':
 
             model.eval()
 
-            membership, assignment = get_assignment(G, model, categorical_dim)
+            membership, assignment = get_assignment(G, model, categorical_dim, features=features)
             #print([(membership == i).sum() for i in range(categorical_dim)])
             #print([(np.array(gt_membership) == i).sum() for i in range(categorical_dim)])
             modularity = classical_modularity_calculator(G, assignment)
@@ -248,5 +276,5 @@ if __name__ == '__main__':
 
             print(epoch, nmi, modularity)
             logging(args, epoch, nmi, modularity)
-    finish_time = time.time() - start
-    print(f"Optimization Finished in {finish_time}")
+
+    print("Optimization Finished!")
