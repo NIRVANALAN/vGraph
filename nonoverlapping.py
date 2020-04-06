@@ -115,6 +115,8 @@ def classical_modularity_calculator(graph, embedding, model='gcn_vae', cluster_n
 def loss_function(recon_c, q_y, prior, c, norm=None, pos_weight=None):
 
     BCE = F.cross_entropy(recon_c, c, reduction='sum') / c.shape[0]
+    # log_qy = torch.log(q_y  + 1e-20)
+    # KLD = torch.sum(q_y*(log_qy - torch.log(prior)),dim=-1).mean()
     KLD = F.kl_div(torch.log(prior), q_y, reduction='batchmean')
     return BCE + KLD
 

@@ -22,7 +22,7 @@ from dgl.transform import remove_self_loop
 from sklearn.cluster import KMeans
 from torch import optim
 from torch.autograd import Variable
-from tqdm import tqdm
+from tqdm import tqdm, trange
 
 from data_utils import load_cora_citeseer, load_webkb
 from gcn.gcn import GCN
@@ -96,6 +96,7 @@ def get_assignment(G, model, num_classes=5, tpe=0, features=None):
 
     res = res.argmax(axis=-1)
     assignment = {i: res[i] for i in range(res.shape[0])}
+    import pdb; pdb.set_trace()
     return res, assignment
 
 
@@ -119,7 +120,7 @@ def loss_function(recon_c, q_y, prior, c, norm=None, pos_weight=None):
 
     BCE = F.cross_entropy(recon_c, c, reduction='sum') / c.shape[0]
     KLD = F.kl_div(torch.log(prior), q_y, reduction='batchmean')
-    return BCE + KLD
+    return BCE, KLD
 
 
 class GCNModelGumbel(nn.Module):
@@ -132,8 +133,8 @@ class GCNModelGumbel(nn.Module):
 
         self.community_embeddings = nn.Linear(
             embedding_dim, categorical_dim, bias=False).to(device)
-        self.node_embeddings_encoder = nn.Embedding(size, embedding_dim)
-        # self.node_embeddings_encoder = embedding_model
+        # self.node_embeddings_encoder = nn.Embedding(size, embedding_dim)
+        self.node_embeddings_encoder = embedding_model
         self.contextnode_embeddings = nn.Embedding(size, embedding_dim)
 
         self.decoder = nn.Sequential(
@@ -152,12 +153,11 @@ class GCNModelGumbel(nn.Module):
 
     def forward(self, w, c, temp, features):
 
-
-        # encoder_h = self.node_embeddings_encoder(features)
-        # w = encoder_h[w]
-        # c = encoder_h[c]
-        w = self.node_embeddings_encoder(w).to(self.device)
-        c = self.node_embeddings_encoder(c).to(self.device)
+        encoder_h = self.node_embeddings_encoder(features)
+        w = encoder_h[w]
+        c = encoder_h[c]
+        # w = self.node_embeddings_encoder(w).to(self.device)
+        # c = self.node_embeddings_encoder(c).to(self.device)
 
         q = self.community_embeddings(w*c)
         # q.shape: [batch_size, categorical_dim]
@@ -175,7 +175,6 @@ class GCNModelGumbel(nn.Module):
         # z.shape [batch_size, categorical_dim]
         new_z = torch.mm(z, self.community_embeddings.weight)
         recon = self.decoder(new_z)
-        import pdb; pdb.set_trace()
 
         return recon, F.softmax(q, dim=-1), prior
 
@@ -221,7 +220,8 @@ if __name__ == '__main__':
                       n_classes,
                       args.n_layers,
                       F.relu,
-                      args.dropout).cuda()
+                      args.dropout, output_projection=False).cuda()
+    print(gcn_encoder)
     # adj_orig = adj
     # adj_orig = adj_orig - sp.dia_matrix((adj_orig.diagonal()[np.newaxis, :], [0]), shape=adj_orig.shape)
     # adj_orig.eliminate_zeros()
@@ -236,45 +236,50 @@ if __name__ == '__main__':
     train_edges = [(u, v) for u, v in G.edges()]
     n_nodes = G.number_of_nodes()
     print('len(train_edges)', len(train_edges))
-    for epoch in range(epochs):
+    with trange(epochs, desc='gcn_vae') as t:
+        for epoch in t:
 
-        t = time.time()
-        batch = torch.LongTensor(train_edges)
-        assert batch.shape == (len(train_edges), 2)
+            start = time.time()
+            batch = torch.LongTensor(train_edges)
+            assert batch.shape == (len(train_edges), 2)
 
-        model.train()
-        optimizer.zero_grad()
+            model.train()
+            optimizer.zero_grad()
 
-        w = torch.cat((batch[:, 0], batch[:, 1]))
-        c = torch.cat((batch[:, 1], batch[:, 0]))
-        recon, q, prior = model(w, c, temp, features)
+            w = torch.cat((batch[:, 0], batch[:, 1]))
+            c = torch.cat((batch[:, 1], batch[:, 0]))
+            recon, q, prior = model(w, c, temp, features)
 
-        res = torch.zeros([n_nodes, categorical_dim],
-                          dtype=torch.float32).to(device)
-        for idx, e in enumerate(train_edges):
-            res[e[0], :] += q[idx, :]
-            res[e[1], :] += q[idx, :]
-        smoothing_loss = args.lamda * ((res[w] - res[c])**2).mean()
+            res = torch.zeros([n_nodes, categorical_dim],
+                              dtype=torch.float32).to(device)
+            for idx, e in enumerate(train_edges):
+                res[e[0], :] += q[idx, :]
+                res[e[1], :] += q[idx, :]
+            smoothing_loss = args.lamda * ((res[w] - res[c])**2).mean()
 
-        loss = loss_function(recon, q, prior, c.to(device), None, None)
-        loss += smoothing_loss
+            bce, kld = loss_function(recon, q, prior, c.to(device), None, None)
+            t.set_postfix(bce=bce.item(), kld=kld.item(),
+                          smoothing=smoothing_loss.item())
+            loss = bce+kld+smoothing_loss
+            # print(f'loss: {loss}')
 
-        loss.backward()
-        cur_loss = loss.item()
-        optimizer.step()
+            loss.backward()
+            cur_loss = loss.item()
+            optimizer.step()
 
-        if epoch % 100 == 0:
-            temp = np.maximum(temp*np.exp(-ANNEAL_RATE*epoch), temp_min)
+            if epoch % 100 == 0:
+                temp = np.maximum(temp*np.exp(-ANNEAL_RATE*epoch), temp_min)
 
-            model.eval()
+                model.eval()
 
-            membership, assignment = get_assignment(G, model, categorical_dim, features=features)
-            #print([(membership == i).sum() for i in range(categorical_dim)])
-            #print([(np.array(gt_membership) == i).sum() for i in range(categorical_dim)])
-            modularity = classical_modularity_calculator(G, assignment)
-            nmi = calc_nonoverlap_nmi(membership.tolist(), gt_membership)
+                membership, assignment = get_assignment(
+                    G, model, categorical_dim, features=features)
+                #print([(membership == i).sum() for i in range(categorical_dim)])
+                #print([(np.array(gt_membership) == i).sum() for i in range(categorical_dim)])
+                modularity = classical_modularity_calculator(G, assignment)
+                nmi = calc_nonoverlap_nmi(membership.tolist(), gt_membership)
 
-            print(epoch, nmi, modularity)
-            logging(args, epoch, nmi, modularity)
+                print(epoch, nmi, modularity)
+                logging(args, epoch, nmi, modularity)
 
-    print("Optimization Finished!")
+    print(f"Optimization Finished in {time.time() - start}")
