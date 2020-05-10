@@ -198,6 +198,7 @@ if __name__ == '__main__':
     print(n_nodes, categorical_dim)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f'device: {device}')
     model = GCNModelGumbel(
         adj.shape[0], embedding_dim, categorical_dim, args.dropout, device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
