@@ -94,9 +94,9 @@ def get_assignment(G, model, num_classes=5, tpe=0, features=None):
             res[e[0], q_argmax[idx]] += 1
             res[e[1], q_argmax[idx]] += 1
 
+    import pdb; pdb.set_trace()
     res = res.argmax(axis=-1)
     assignment = {i: res[i] for i in range(res.shape[0])}
-    import pdb; pdb.set_trace()
     return res, assignment
 
 
@@ -135,7 +135,7 @@ class GCNModelGumbel(nn.Module):
             embedding_dim, categorical_dim, bias=False).to(device)
         # self.node_embeddings_encoder = nn.Embedding(size, embedding_dim)
         self.node_embeddings_encoder = embedding_model
-        self.contextnode_embeddings = nn.Embedding(size, embedding_dim)
+        # self.contextnode_embeddings = nn.Embedding(size, embedding_dim)
 
         self.decoder = nn.Sequential(
             nn.Linear(embedding_dim, size),
@@ -163,7 +163,7 @@ class GCNModelGumbel(nn.Module):
         # q.shape: [batch_size, categorical_dim]
         # z = self._sample_discrete(q, temp)
         if self.training:
-            z = F.gumbel_softmax(logits=q, tau=temp, hard=True)
+            z = F.gumbel_softmax(logits=q, tau=temp, hard=True) #! hard estimator z is one-hot
         else:
             tmp = q.argmax(dim=-1).reshape(q.shape[0], 1)
             z = torch.zeros(q.shape).to(self.device).scatter_(1, tmp, 1.)
@@ -173,7 +173,8 @@ class GCNModelGumbel(nn.Module):
         # prior.shape [batch_num_nodes,
 
         # z.shape [batch_size, categorical_dim]
-        new_z = torch.mm(z, self.community_embeddings.weight)
+        import pdb; pdb.set_trace()
+        new_z = torch.mm(z, self.community_embeddings.weight) #! estimated community membership embedding of each edge
         recon = self.decoder(new_z)
 
         return recon, F.softmax(q, dim=-1), prior
